@@ -53,9 +53,9 @@ left), so a re-sync into an existing tree moves only what changed and leaves
 nothing stale. `--dry-run` reports what would be fetched (and pruned) and writes
 nothing.
 
-There is no `--pin`. A package is taken at its tip, which the store republishes
-on every green deploy of its producer; a caller that passes `--pin` is told so
-and refused (exit 2).
+kura-cli does not support pinning, because it is not helpful in active
+development; this is a team level message: do not pin packages. A caller that
+passes `--pin` is told exactly that and refused (exit 2).
 
 ```sh
 $ kura fetch anicu ./ext/anicu

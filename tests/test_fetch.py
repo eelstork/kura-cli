@@ -240,7 +240,8 @@ class FetchTest(unittest.TestCase):
             code = kura_cli.main(["fetch", "demo", str(self.dest), "--url", self.url,
                                   "--key", KEY, "--pin", "demo-abc123"])
         self.assertEqual(code, 2)
-        self.assertIn("we do not pin", err.getvalue())
+        self.assertIn("does not support pinning", err.getvalue())
+        self.assertIn("do not pin packages", err.getvalue())
         self.assertFalse((self.dest / "a.ts").exists())  # nothing was fetched
 
     def test_no_strip_keeps_the_package_prefix(self):

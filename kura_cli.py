@@ -295,15 +295,14 @@ def main(argv=None):
     f.add_argument("--prune", action="store_true",
                    help="afterwards, remove files under <dest> the package no longer lists")
     f.add_argument("--quiet", action="store_true", help="print nothing on success")
-    # Accepted so that it can be refused: we do not pin. A package is taken at
-    # its tip, and a caller asking otherwise is told so here, at the source,
-    # rather than quietly served the tip under a name it did not ask for.
+    # Accepted so that it can be refused, at the source, in the team's words:
+    # pinning is not helpful in active development, so nobody pins.
     f.add_argument("--pin", metavar="PIN", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.pin is not None:
-        print(f"kura: --pin {args.pin}: we do not pin. A package is taken at its tip, which "
-              "the store republishes on every green deploy of its producer; drop the pin.",
+        print(f"kura: --pin {args.pin}: kura-cli does not support pinning, because it is not "
+              "helpful in active development; this is a team level message, do not pin packages.",
               file=sys.stderr)
         return 2
 
