@@ -6,7 +6,9 @@ batch so the fallback (split, then one-at-a-time /blob) is exercised for real.
 """
 
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import struct
@@ -204,6 +206,42 @@ class FetchTest(unittest.TestCase):
         self.store.add("demo", "a", b"one")
         with self.assertRaises(kura_cli.KuraError):
             self._fetch(key="wrong")
+
+    def test_prune_removes_what_the_package_no_longer_lists(self):
+        self.store.add("demo", "keep.ts", b"keep")
+        (self.dest / "gone").mkdir()
+        (self.dest / "gone/old.ts").write_bytes(b"stale")
+        (self.dest / ".provenance.json").write_bytes(b"{}")
+        res = self._fetch(prune=True)
+        self.assertEqual(res["pruned"], 1)
+        self.assertTrue((self.dest / "keep.ts").exists())
+        self.assertFalse((self.dest / "gone/old.ts").exists())
+        self.assertFalse((self.dest / "gone").exists())  # and the emptied directory
+        self.assertTrue((self.dest / ".provenance.json").exists())  # the consumer's own note
+
+    def test_without_prune_a_stale_file_is_left_alone(self):
+        self.store.add("demo", "keep.ts", b"keep")
+        (self.dest / "old.ts").write_bytes(b"stale")
+        res = self._fetch()
+        self.assertNotIn("pruned", {k: v for k, v in res.items() if v})
+        self.assertTrue((self.dest / "old.ts").exists())
+
+    def test_dry_run_with_prune_reports_and_removes_nothing(self):
+        self.store.add("demo", "keep.ts", b"keep")
+        (self.dest / "old.ts").write_bytes(b"stale")
+        res = self._fetch(prune=True, dry_run=True)
+        self.assertEqual(res["would_prune"], 1)
+        self.assertTrue((self.dest / "old.ts").exists())
+
+    def test_pin_is_refused_at_the_source(self):
+        self.store.add("demo", "a.ts", b"alpha")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = kura_cli.main(["fetch", "demo", str(self.dest), "--url", self.url,
+                                  "--key", KEY, "--pin", "demo-abc123"])
+        self.assertEqual(code, 2)
+        self.assertIn("we do not pin", err.getvalue())
+        self.assertFalse((self.dest / "a.ts").exists())  # nothing was fetched
 
     def test_no_strip_keeps_the_package_prefix(self):
         self.store.add("demo", "src/a.ts", b"alpha")

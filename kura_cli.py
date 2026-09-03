@@ -192,12 +192,19 @@ def _on_disk_matches(path: Path, digest: str) -> bool:
         return False
 
 
-def fetch(package, dest, url=None, key=None, strip=True, dry_run=False):
+# a consumer's own note beside the tree; never a package's file, never pruned
+PROVENANCE = ".provenance.json"
+
+
+def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=False):
     """Materialise `package` from the store into `dest`.
 
-    Returns a summary dict: files, written, skipped, fetched_blobs, fetched_bytes.
-    By default the leading `<package>/` prefix is stripped so `dest` holds the
-    package's tree directly; pass strip=False to keep it.
+    Returns a summary dict: files, written, skipped, fetched_blobs, fetched_bytes
+    (and pruned, when asked). By default the leading `<package>/` prefix is
+    stripped so `dest` holds the package's tree directly; pass strip=False to
+    keep it. With prune=True, files under `dest` that the package no longer
+    lists are removed afterwards (a consumer's `.provenance.json` is left), so
+    a re-sync moves only what changed and leaves nothing stale behind.
     """
     base = (url or os.environ.get("KURA_URL") or DEFAULT_URL).rstrip("/")
     token = key or os.environ.get("KURA_KEY")
@@ -227,12 +234,15 @@ def fetch(package, dest, url=None, key=None, strip=True, dry_run=False):
         else:
             needed.append(digest)
 
+    stale = _stale(dest, {p for ps in by_digest.values() for p in ps}) if prune else []
+
     if dry_run:
         return {"files": len(manifest), "written": 0, "skipped": skipped,
-                "fetched_blobs": 0, "fetched_bytes": 0, "would_fetch_blobs": len(needed)}
+                "fetched_blobs": 0, "fetched_bytes": 0, "would_fetch_blobs": len(needed),
+                "would_prune": len(stale)}
 
     summary = {"files": len(manifest), "written": 0, "skipped": skipped,
-               "fetched_blobs": 0, "fetched_bytes": 0}
+               "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0}
 
     def on_blob(digest, data):
         if hashlib.sha256(data).hexdigest() != digest:
@@ -245,7 +255,23 @@ def fetch(package, dest, url=None, key=None, strip=True, dry_run=False):
             summary["written"] += 1
 
     _deliver(base, token, needed, on_blob)
+    for p in stale:
+        p.unlink()
+        summary["pruned"] += 1
+        # and the directories it leaves empty, up to dest
+        d = p.parent
+        while d != dest and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
     return summary
+
+
+def _stale(dest: Path, keep: set) -> list:
+    """Files under `dest` that are not the package's, in a stable order."""
+    if not dest.is_dir():
+        return []
+    return sorted(p for p in dest.rglob("*")
+                  if p.is_file() and p not in keep and p.name != PROVENANCE)
 
 
 def _quote(s: str) -> str:
@@ -266,24 +292,38 @@ def main(argv=None):
     f.add_argument("--no-strip", dest="strip", action="store_false",
                    help="keep the leading <package>/ prefix on written paths")
     f.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
+    f.add_argument("--prune", action="store_true",
+                   help="afterwards, remove files under <dest> the package no longer lists")
     f.add_argument("--quiet", action="store_true", help="print nothing on success")
+    # Accepted so that it can be refused: we do not pin. A package is taken at
+    # its tip, and a caller asking otherwise is told so here, at the source,
+    # rather than quietly served the tip under a name it did not ask for.
+    f.add_argument("--pin", metavar="PIN", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.pin is not None:
+        print(f"kura: --pin {args.pin}: we do not pin. A package is taken at its tip, which "
+              "the store republishes on every green deploy of its producer; drop the pin.",
+              file=sys.stderr)
+        return 2
 
     try:
         res = fetch(args.package, args.dest, url=args.url, key=args.key,
-                    strip=args.strip, dry_run=args.dry_run)
+                    strip=args.strip, dry_run=args.dry_run, prune=args.prune)
     except KuraError as e:
         print(f"kura: {e}", file=sys.stderr)
         return 1
 
     if not args.quiet:
         if args.dry_run:
+            prune = f", would prune {res['would_prune']}" if args.prune else ""
             print(f"kura: {args.package}: {res['files']} file(s); "
-                  f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s)")
+                  f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s){prune}")
         else:
             mb = res["fetched_bytes"] / 1e6
+            prune = f", pruned {res['pruned']}" if args.prune else ""
             print(f"kura: {args.package}: {res['files']} file(s) -> {args.dest}; "
-                  f"wrote {res['written']}, skipped {res['skipped']} "
+                  f"wrote {res['written']}, skipped {res['skipped']}{prune} "
                   f"({res['fetched_blobs']} blob(s), {mb:.1f} MB fetched)")
     return 0
 

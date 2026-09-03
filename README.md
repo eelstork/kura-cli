@@ -37,7 +37,7 @@ Python 3.8+, nothing else.
 ## Use
 
 ```sh
-kura fetch <package> <dest> [--url URL] [--key KEY] [--no-strip] [--dry-run] [--quiet]
+kura fetch <package> <dest> [--url URL] [--key KEY] [--no-strip] [--prune] [--dry-run] [--quiet]
 ```
 
 | | |
@@ -47,8 +47,15 @@ kura fetch <package> <dest> [--url URL] [--key KEY] [--no-strip] [--dry-run] [--
 
 By default the leading `<package>/` prefix is stripped, so `kura fetch anicu
 ./ext/anicu` writes `./ext/anicu/src/...` and `./ext/anicu/public/...`. Pass
-`--no-strip` to keep the prefix. `--dry-run` reports what would be fetched and
-writes nothing.
+`--no-strip` to keep the prefix. `--prune` removes, afterwards, any file under
+`<dest>` the package no longer lists (a consumer's own `.provenance.json` is
+left), so a re-sync into an existing tree moves only what changed and leaves
+nothing stale. `--dry-run` reports what would be fetched (and pruned) and writes
+nothing.
+
+There is no `--pin`. A package is taken at its tip, which the store republishes
+on every green deploy of its producer; a caller that passes `--pin` is told so
+and refused (exit 2).
 
 ```sh
 $ kura fetch anicu ./ext/anicu
