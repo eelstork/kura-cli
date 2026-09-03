@@ -1,0 +1,18 @@
+[project]
+name = "kura-cli"
+version = "0.1.0"
+description = "Fetch a package's files out of a kura store."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.scripts]
+kura = "kura_cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["kura_cli"]
