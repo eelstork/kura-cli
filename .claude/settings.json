@@ -15,5 +15,22 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "Skill",
+      "mcp__github",
+      "mcp__Claude_Code_Remote"
+    ]
   }
 }
