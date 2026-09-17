@@ -195,6 +195,11 @@ def _on_disk_matches(path: Path, digest: str) -> bool:
 # a consumer's own note beside the tree; never a package's file, never pruned
 PROVENANCE = ".provenance.json"
 
+# resolve's record beside the tree: the roots, the packages the closure covered,
+# and the base the store read them at — a build's note of which world it drew
+# from. Ours, never a package's file, never pruned.
+CLOSURE = ".closure.json"
+
 
 def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=False):
     """Materialise `package` from the store into `dest`.
@@ -279,11 +284,91 @@ def _quote(s: str) -> str:
     return quote(s, safe="")
 
 
+# --- resolve: a whole dependency closure in one call -----------------------
+#
+# `fetch` materialises one package. A consumer needs the package AND everything
+# it depends on, and it used to get that by listing the closure itself and
+# fetching a package at a time. The store can walk its own dependency graph, so
+# `resolve` asks for the closure of some roots (GET /closure) and fetches every
+# blob it names in one pass — the same content-addressed /blobs2 as fetch, so
+# blobs shared across packages move once. The tree lands at dest/<package>/...,
+# the layout a consumer aliases `@<package>` against.
+
+def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
+    """Materialise the transitive closure of `roots` into `dest`.
+
+    Returns a summary dict: packages, base, files, written, skipped,
+    fetched_blobs, fetched_bytes, and pruned/would_* as for `fetch`. Writes
+    `.closure.json` beside the tree — the roots, the packages resolved and the
+    base the store read them at — so a build records exactly which world it
+    drew from. With prune (the default) files the closure no longer names are
+    removed, so a re-resolve leaves nothing stale from a dependency that left."""
+    base_url = (url or os.environ.get("KURA_URL") or DEFAULT_URL).rstrip("/")
+    token = key or os.environ.get("KURA_KEY")
+    if not token:
+        raise KuraError("no key: set KURA_KEY or pass --key")
+    dest = Path(dest)
+
+    q = ",".join(_quote(r) for r in roots)
+    body = _get_json(base_url, f"/closure?roots={q}", token)
+    manifest: dict[str, str] = body.get("manifest", {})
+    packages: list[str] = body.get("packages", [])
+    store_base = body.get("base")
+
+    by_digest: dict[str, list[Path]] = {}
+    for display, digest in manifest.items():
+        by_digest.setdefault(digest, []).append(dest / display)
+
+    needed, skipped = [], 0
+    for digest, paths in by_digest.items():
+        if all(_on_disk_matches(p, digest) for p in paths):
+            skipped += len(paths)
+        else:
+            needed.append(digest)
+
+    keep = {p for ps in by_digest.values() for p in ps}
+    keep.add(dest / CLOSURE)  # the lockfile is ours, never stale
+    stale = _stale(dest, keep) if prune else []
+
+    if dry_run:
+        return {"packages": packages, "base": store_base, "files": len(manifest),
+                "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0,
+                "would_fetch_blobs": len(needed), "would_prune": len(stale)}
+
+    summary = {"packages": packages, "base": store_base, "files": len(manifest),
+               "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0}
+
+    def on_blob(digest, data):
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise KuraError(f"the store returned the wrong bytes for {digest} (digest mismatch)")
+        summary["fetched_blobs"] += 1
+        summary["fetched_bytes"] += len(data)
+        for p in by_digest[digest]:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            summary["written"] += 1
+
+    _deliver(base_url, token, needed, on_blob)
+    for p in stale:
+        p.unlink()
+        summary["pruned"] += 1
+        d = p.parent
+        while d != dest and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / CLOSURE).write_text(
+        json.dumps({"roots": list(roots), "packages": packages, "base": store_base},
+                   indent=2, sort_keys=True) + "\n")
+    return summary
+
+
 # --- CLI -------------------------------------------------------------------
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="kura", description="fetch a package out of a kura store")
+    parser = argparse.ArgumentParser(prog="kura", description="fetch packages out of a kura store")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
     f = sub.add_parser("fetch", help="materialise a package into a directory")
     f.add_argument("package")
     f.add_argument("dest")
@@ -298,32 +383,58 @@ def main(argv=None):
     # Accepted so that it can be refused, at the source, in the team's words:
     # pinning is not helpful in active development, so nobody pins.
     f.add_argument("--pin", metavar="PIN", help=argparse.SUPPRESS)
+
+    r = sub.add_parser("resolve", help="materialise root packages and their whole dependency closure")
+    r.add_argument("dest")
+    r.add_argument("roots", nargs="+", help="root packages; their transitive closure is fetched")
+    r.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
+    r.add_argument("--key", help="bearer token (default $KURA_KEY)")
+    r.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
+    r.add_argument("--no-prune", dest="prune", action="store_false",
+                   help="keep files the closure no longer names (default: prune them)")
+    r.add_argument("--quiet", action="store_true", help="print nothing on success")
+
     args = parser.parse_args(argv)
 
-    if args.pin is not None:
+    if getattr(args, "pin", None) is not None:
         print(f"kura: --pin {args.pin}: kura-cli does not support pinning, because it is not "
               "helpful in active development; this is a team level message, do not pin packages.",
               file=sys.stderr)
         return 2
 
     try:
-        res = fetch(args.package, args.dest, url=args.url, key=args.key,
-                    strip=args.strip, dry_run=args.dry_run, prune=args.prune)
+        if args.cmd == "resolve":
+            res = resolve(args.dest, args.roots, url=args.url, key=args.key,
+                          dry_run=args.dry_run, prune=args.prune)
+        else:
+            res = fetch(args.package, args.dest, url=args.url, key=args.key,
+                        strip=args.strip, dry_run=args.dry_run, prune=args.prune)
     except KuraError as e:
         print(f"kura: {e}", file=sys.stderr)
         return 1
 
-    if not args.quiet:
+    if args.quiet:
+        return 0
+    if args.cmd == "resolve":
+        n = len(res["packages"])
         if args.dry_run:
-            prune = f", would prune {res['would_prune']}" if args.prune else ""
-            print(f"kura: {args.package}: {res['files']} file(s); "
-                  f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s){prune}")
+            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}: {n} package(s), "
+                  f"{res['files']} file(s); would fetch {res['would_fetch_blobs']}, would prune {res['would_prune']}")
         else:
             mb = res["fetched_bytes"] / 1e6
-            prune = f", pruned {res['pruned']}" if args.prune else ""
-            print(f"kura: {args.package}: {res['files']} file(s) -> {args.dest}; "
-                  f"wrote {res['written']}, skipped {res['skipped']}{prune} "
-                  f"({res['fetched_blobs']} blob(s), {mb:.1f} MB fetched)")
+            print(f"kura: resolved {n} package(s) -> {args.dest} @base {res['base']}; "
+                  f"wrote {res['written']}, skipped {res['skipped']}, pruned {res['pruned']} "
+                  f"({res['fetched_blobs']} blob(s), {mb:.1f} MB)")
+    elif args.dry_run:
+        prune = f", would prune {res['would_prune']}" if args.prune else ""
+        print(f"kura: {args.package}: {res['files']} file(s); "
+              f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s){prune}")
+    else:
+        mb = res["fetched_bytes"] / 1e6
+        prune = f", pruned {res['pruned']}" if args.prune else ""
+        print(f"kura: {args.package}: {res['files']} file(s) -> {args.dest}; "
+              f"wrote {res['written']}, skipped {res['skipped']}{prune} "
+              f"({res['fetched_blobs']} blob(s), {mb:.1f} MB fetched)")
     return 0
 
 
