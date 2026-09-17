@@ -198,6 +198,25 @@ class ResolveTest(unittest.TestCase):
         lock = json.loads((self.dest / ".closure.json").read_text())
         self.assertNotIn("bigrock", lock["packages"])
 
+    def test_an_unresolved_root_refuses_and_does_not_wipe_the_tree(self):
+        # a typo'd or unpublished root returns an empty/partial closure from the
+        # store; resolve must refuse rather than prune a populated ext/ to nothing
+        self._chain()
+        self._resolve("metropolis")
+        before = sorted(p.name for p in (self.dest / "metropolis").rglob("*"))
+        with self.assertRaises(kura_cli.KuraError):
+            self._resolve("metropoliss")          # one-letter typo -> unknown root
+        self.assertTrue((self.dest / "metropolis/src/town.ts").exists())  # nothing wiped
+        self.assertTrue((self.dest / "shadelark/src/raster.ts").exists())
+        self.assertEqual(sorted(p.name for p in (self.dest / "metropolis").rglob("*")), before)
+
+    def test_a_partly_unresolved_root_set_also_refuses(self):
+        self._chain()
+        self._resolve("metropolis")
+        with self.assertRaises(kura_cli.KuraError):
+            self._resolve("metropolis", "nope")   # one good, one unknown
+        self.assertTrue((self.dest / "metropolis/src/town.ts").exists())
+
     def test_the_lockfile_is_not_pruned_on_a_reresolve(self):
         self._chain()
         self._resolve("metropolis")

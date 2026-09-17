@@ -315,6 +315,19 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
     packages: list[str] = body.get("packages", [])
     store_base = body.get("base")
 
+    # A root that does not resolve — a typo, a package not yet published, or the
+    # wrong store — comes back simply absent from the closure, not as an error.
+    # With prune on (the default) an empty or partial closure would then delete
+    # everything under `dest`. Refuse it: a closure missing any requested root is
+    # degenerate, never something to materialise over a good tree. (fetch guards
+    # the same way with its empty-manifest check.)
+    missing = [r for r in roots if r not in packages]
+    if missing:
+        raise KuraError(
+            f"closure did not resolve root(s): {', '.join(missing)} — refusing to touch "
+            f"{dest} (a typo, an unpublished package, or the wrong KURA_URL would "
+            f"otherwise prune the whole tree)")
+
     by_digest: dict[str, list[Path]] = {}
     for display, digest in manifest.items():
         by_digest.setdefault(digest, []).append(dest / display)
