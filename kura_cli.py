@@ -195,6 +195,19 @@ def _on_disk_matches(path: Path, digest: str) -> bool:
 # a consumer's own note beside the tree; never a package's file, never pruned
 PROVENANCE = ".provenance.json"
 
+# resolve's record beside the tree: the roots requested, the packages the
+# closure covered, the base the store read them at, and each package's public
+# root — a build's note of which world it drew from. Ours, never a package's
+# file, never pruned.
+CLOSURE = ".closure.json"
+
+# sync also writes these from the closure: the vite/vitest alias map (inside the
+# tree) and tsc's paths (at the repo root, where tsconfig.json extends it). Both
+# generated, both gitignored by the consumer — no alias or root logic is kept by
+# hand in a consumer any more.
+ALIASES = ".aliases.json"
+TSCONFIG_PATHS = "tsconfig.paths.json"
+
 
 def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=False):
     """Materialise `package` from the store into `dest`.
@@ -279,11 +292,153 @@ def _quote(s: str) -> str:
     return quote(s, safe="")
 
 
+# --- resolve: a whole dependency closure in one call -----------------------
+#
+# `fetch` materialises one package. A consumer needs the package AND everything
+# it depends on, and it used to get that by listing the closure itself and
+# fetching a package at a time. The store can walk its own dependency graph, so
+# `resolve` asks for the closure of some roots (GET /closure) and fetches every
+# blob it names in one pass — the same content-addressed /blobs2 as fetch, so
+# blobs shared across packages move once. The tree lands at dest/<package>/...,
+# the layout a consumer aliases `@<package>` against.
+
+def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
+    """Materialise the transitive closure of `roots` into `dest`.
+
+    Returns a summary dict: packages, base, files, written, skipped,
+    fetched_blobs, fetched_bytes, and pruned/would_* as for `fetch`. Writes
+    `.closure.json` beside the tree — the roots, the packages resolved and the
+    base the store read them at — so a build records exactly which world it
+    drew from. With prune (the default) files the closure no longer names are
+    removed, so a re-resolve leaves nothing stale from a dependency that left."""
+    base_url = (url or os.environ.get("KURA_URL") or DEFAULT_URL).rstrip("/")
+    token = key or os.environ.get("KURA_KEY")
+    if not token:
+        raise KuraError("no key: set KURA_KEY or pass --key")
+    dest = Path(dest)
+
+    q = ",".join(_quote(r) for r in roots)
+    body = _get_json(base_url, f"/closure?roots={q}", token)
+    manifest: dict[str, str] = body.get("manifest", {})
+    packages: list[str] = body.get("packages", [])
+    store_base = body.get("base")
+    roots_map: dict[str, str] = body.get("roots", {})  # package -> its public root
+
+    # A root that does not resolve — a typo, a package not yet published, or the
+    # wrong store — comes back simply absent from the closure, not as an error.
+    # With prune on (the default) an empty or partial closure would then delete
+    # everything under `dest`. Refuse it: a closure missing any requested root is
+    # degenerate, never something to materialise over a good tree. (fetch guards
+    # the same way with its empty-manifest check.)
+    missing = [r for r in roots if r not in packages]
+    if missing:
+        raise KuraError(
+            f"closure did not resolve root(s): {', '.join(missing)} — refusing to touch "
+            f"{dest} (a typo, an unpublished package, or the wrong KURA_URL would "
+            f"otherwise prune the whole tree)")
+
+    by_digest: dict[str, list[Path]] = {}
+    for display, digest in manifest.items():
+        by_digest.setdefault(digest, []).append(dest / display)
+
+    needed, skipped = [], 0
+    for digest, paths in by_digest.items():
+        if all(_on_disk_matches(p, digest) for p in paths):
+            skipped += len(paths)
+        else:
+            needed.append(digest)
+
+    keep = {p for ps in by_digest.values() for p in ps}
+    keep.add(dest / CLOSURE)  # the lockfile is ours, never stale
+    stale = _stale(dest, keep) if prune else []
+
+    if dry_run:
+        return {"packages": packages, "base": store_base, "roots": roots_map, "files": len(manifest),
+                "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0,
+                "would_fetch_blobs": len(needed), "would_prune": len(stale)}
+
+    summary = {"packages": packages, "base": store_base, "roots": roots_map, "files": len(manifest),
+               "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0}
+
+    def on_blob(digest, data):
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise KuraError(f"the store returned the wrong bytes for {digest} (digest mismatch)")
+        summary["fetched_blobs"] += 1
+        summary["fetched_bytes"] += len(data)
+        for p in by_digest[digest]:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            summary["written"] += 1
+
+    _deliver(base_url, token, needed, on_blob)
+    for p in stale:
+        p.unlink()
+        summary["pruned"] += 1
+        d = p.parent
+        while d != dest and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / CLOSURE).write_text(
+        json.dumps({"requested": list(roots), "packages": packages, "base": store_base,
+                    "roots": roots_map}, indent=2, sort_keys=True) + "\n")
+    return summary
+
+
+# --- sync: resolve, and write the consumer's generated harness ---------------
+#
+# resolve materialises the closure; a TypeScript consumer then needs two files
+# generated from it — the vite/vitest alias map and tsconfig's paths — both of
+# which used to be written by hand in every repo, each carrying its own copy of
+# the roots map. sync writes them from the store's own data (the roots come down
+# in the closure), so a consumer keeps no alias or root logic of its own: its
+# direct deps in packages.json, and a one-line read of the generated files.
+
+def _harness(dest: Path, packages, roots_map):
+    """The alias map and tsconfig paths for a materialised closure. Values are
+    relative to the repo root (dest's parent), so vite resolves each against its
+    config dir and tsc against baseUrl '.'."""
+    rel = dest.name  # 'ext' by convention; dest is <repo>/ext
+    exts = ("index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs", "index.cjs")
+    aliases: dict[str, str] = {}
+    ts_paths: dict[str, list[str]] = {}
+    for name in packages:
+        root = roots_map.get(name, "src")
+        base = f"{rel}/{name}/{root}"
+        aliases[f"@{name}"] = base
+        ts_paths[f"@{name}/*"] = [f"{base}/*"]
+        # a bare @<name> resolves to the package index; match the extensions vite
+        # resolves a directory index across, so tsc and vite agree
+        for ext in exts:
+            if (dest / name / root / ext).exists():
+                ts_paths[f"@{name}"] = [f"{base}/{ext}"]
+                break
+    return aliases, ts_paths
+
+
+def sync(dest, roots, url=None, key=None, dry_run=False, prune=True):
+    """Resolve the closure of `roots` into `dest`, then write the consumer's
+    generated harness beside it: `<dest>/.aliases.json` (the vite/vitest alias
+    map) and `<repo>/tsconfig.paths.json` (tsc's paths), both from the store's
+    closure data. Returns resolve's summary plus `aliased` (the alias count)."""
+    res = resolve(dest, roots, url=url, key=key, dry_run=dry_run, prune=prune)
+    if dry_run:
+        return res
+    dest = Path(dest)
+    aliases, ts_paths = _harness(dest, res["packages"], res.get("roots", {}))
+    (dest / ALIASES).write_text(json.dumps(aliases, indent=2, sort_keys=True) + "\n")
+    (dest.parent / TSCONFIG_PATHS).write_text(
+        json.dumps({"compilerOptions": {"baseUrl": ".", "paths": ts_paths}}, indent=2, sort_keys=True) + "\n")
+    res["aliased"] = len(aliases)
+    return res
+
+
 # --- CLI -------------------------------------------------------------------
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="kura", description="fetch a package out of a kura store")
+    parser = argparse.ArgumentParser(prog="kura", description="fetch packages out of a kura store")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
     f = sub.add_parser("fetch", help="materialise a package into a directory")
     f.add_argument("package")
     f.add_argument("dest")
@@ -298,32 +453,81 @@ def main(argv=None):
     # Accepted so that it can be refused, at the source, in the team's words:
     # pinning is not helpful in active development, so nobody pins.
     f.add_argument("--pin", metavar="PIN", help=argparse.SUPPRESS)
+
+    r = sub.add_parser("resolve", help="materialise root packages and their whole dependency closure")
+    r.add_argument("dest")
+    r.add_argument("roots", nargs="+", help="root packages; their transitive closure is fetched")
+    r.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
+    r.add_argument("--key", help="bearer token (default $KURA_KEY)")
+    r.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
+    r.add_argument("--no-prune", dest="prune", action="store_false",
+                   help="keep files the closure no longer names (default: prune them)")
+    r.add_argument("--quiet", action="store_true", help="print nothing on success")
+
+    s = sub.add_parser("sync", help="resolve a closure and write the consumer's generated harness")
+    s.add_argument("dest")
+    s.add_argument("roots", nargs="+", help="root packages; their transitive closure is fetched")
+    s.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
+    s.add_argument("--key", help="bearer token (default $KURA_KEY)")
+    s.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
+    s.add_argument("--no-prune", dest="prune", action="store_false",
+                   help="keep files the closure no longer names (default: prune them)")
+    s.add_argument("--quiet", action="store_true", help="print nothing on success")
+
     args = parser.parse_args(argv)
 
-    if args.pin is not None:
+    if getattr(args, "pin", None) is not None:
         print(f"kura: --pin {args.pin}: kura-cli does not support pinning, because it is not "
               "helpful in active development; this is a team level message, do not pin packages.",
               file=sys.stderr)
         return 2
 
     try:
-        res = fetch(args.package, args.dest, url=args.url, key=args.key,
-                    strip=args.strip, dry_run=args.dry_run, prune=args.prune)
+        if args.cmd == "sync":
+            res = sync(args.dest, args.roots, url=args.url, key=args.key,
+                       dry_run=args.dry_run, prune=args.prune)
+        elif args.cmd == "resolve":
+            res = resolve(args.dest, args.roots, url=args.url, key=args.key,
+                          dry_run=args.dry_run, prune=args.prune)
+        else:
+            res = fetch(args.package, args.dest, url=args.url, key=args.key,
+                        strip=args.strip, dry_run=args.dry_run, prune=args.prune)
     except KuraError as e:
         print(f"kura: {e}", file=sys.stderr)
         return 1
 
-    if not args.quiet:
+    if args.quiet:
+        return 0
+    if args.cmd == "sync":
+        n = len(res["packages"])
         if args.dry_run:
-            prune = f", would prune {res['would_prune']}" if args.prune else ""
-            print(f"kura: {args.package}: {res['files']} file(s); "
-                  f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s){prune}")
+            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}: {n} package(s); "
+                  f"would fetch {res['would_fetch_blobs']}")
         else:
             mb = res["fetched_bytes"] / 1e6
-            prune = f", pruned {res['pruned']}" if args.prune else ""
-            print(f"kura: {args.package}: {res['files']} file(s) -> {args.dest}; "
-                  f"wrote {res['written']}, skipped {res['skipped']}{prune} "
-                  f"({res['fetched_blobs']} blob(s), {mb:.1f} MB fetched)")
+            print(f"kura: synced {n} package(s) -> {args.dest} @base {res['base']}; "
+                  f"wrote {res['written']}, pruned {res['pruned']} ({mb:.1f} MB); "
+                  f"harness: {res['aliased']} aliases + tsconfig paths")
+    elif args.cmd == "resolve":
+        n = len(res["packages"])
+        if args.dry_run:
+            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}: {n} package(s), "
+                  f"{res['files']} file(s); would fetch {res['would_fetch_blobs']}, would prune {res['would_prune']}")
+        else:
+            mb = res["fetched_bytes"] / 1e6
+            print(f"kura: resolved {n} package(s) -> {args.dest} @base {res['base']}; "
+                  f"wrote {res['written']}, skipped {res['skipped']}, pruned {res['pruned']} "
+                  f"({res['fetched_blobs']} blob(s), {mb:.1f} MB)")
+    elif args.dry_run:
+        prune = f", would prune {res['would_prune']}" if args.prune else ""
+        print(f"kura: {args.package}: {res['files']} file(s); "
+              f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s){prune}")
+    else:
+        mb = res["fetched_bytes"] / 1e6
+        prune = f", pruned {res['pruned']}" if args.prune else ""
+        print(f"kura: {args.package}: {res['files']} file(s) -> {args.dest}; "
+              f"wrote {res['written']}, skipped {res['skipped']}{prune} "
+              f"({res['fetched_blobs']} blob(s), {mb:.1f} MB fetched)")
     return 0
 
 
