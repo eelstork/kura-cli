@@ -36,14 +36,17 @@ class StubStore:
         self.blobs: dict[str, bytes] = {}
         self.files: dict[str, dict[str, str]] = {}   # package -> {display path -> digest}
         self.deps: dict[str, list[str]] = {}         # package -> [dependency names]
+        self.roots: dict[str, str] = {}              # package -> public root
         self.base = 0
 
-    def add(self, package, relpath, data, deps=None):
+    def add(self, package, relpath, data, deps=None, root=None):
         d = _digest(data)
         self.blobs[d] = data
         self.files.setdefault(package, {})[f"{package}/{relpath}"] = d
         if deps is not None:
             self.deps[package] = deps
+        if root is not None:
+            self.roots[package] = root
         self.base += 1
         return d
 
@@ -59,7 +62,8 @@ class StubStore:
         manifest: dict[str, str] = {}
         for p in sorted(seen):
             manifest.update(self.files.get(p, {}))
-        return {"packages": sorted(seen), "manifest": manifest, "base": self.base}
+        return {"packages": sorted(seen), "manifest": manifest, "base": self.base,
+                "roots": {p: self.roots.get(p, "src") for p in sorted(seen)}}
 
 
 def _make_handler(store: StubStore):
@@ -167,9 +171,10 @@ class ResolveTest(unittest.TestCase):
         self._chain()
         self._resolve("metropolis")
         lock = json.loads((self.dest / ".closure.json").read_text())
-        self.assertEqual(lock["roots"], ["metropolis"])
+        self.assertEqual(lock["requested"], ["metropolis"])   # the roots asked for
         self.assertEqual(set(lock["packages"]), {"metropolis", "diarch", "ikea", "shadelark", "bigrock"})
         self.assertEqual(lock["base"], self.store.base)
+        self.assertEqual(set(lock["roots"]), set(lock["packages"]))   # per-package root map
 
     def test_a_blob_shared_across_packages_moves_once(self):
         self.store.add("a", "x.ts", b"same", deps=[])
@@ -241,6 +246,58 @@ class ResolveTest(unittest.TestCase):
                               "--url", self.url, "--key", KEY, "--quiet"])
         self.assertEqual(code, 0)
         self.assertTrue((self.dest / "ikea/src/prop.ts").exists())
+
+
+class SyncTest(unittest.TestCase):
+    def setUp(self):
+        self.store = StubStore()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self.store))
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        host, port = self.httpd.server_address
+        self.url = f"http://{host}:{port}"
+        self._dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self._dir.name)
+        self.dest = self.repo / "ext"   # dest is <repo>/ext by convention
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self._dir.cleanup()
+
+    def _sync(self, *roots, **kw):
+        kw.setdefault("url", self.url)
+        kw.setdefault("key", KEY)
+        return kura_cli.sync(self.dest, list(roots), **kw)
+
+    def test_sync_writes_the_alias_map_and_tsconfig_paths_from_the_store_roots(self):
+        self.store.add("shadelark", "src/raster.ts", b"raster", deps=[])
+        self.store.add("bigrock", "src/rock/masonry.ts", b"masonry", deps=[], root="src/rock")
+        self.store.add("ikea", "src/index.ts", b"export const e = 1;", deps=["shadelark", "bigrock"])
+        self._sync("ikea")
+
+        aliases = json.loads((self.dest / ".aliases.json").read_text())
+        self.assertEqual(aliases["@shadelark"], "ext/shadelark/src")
+        self.assertEqual(aliases["@bigrock"], "ext/bigrock/src/rock")   # non-default root honoured
+        self.assertEqual(aliases["@ikea"], "ext/ikea/src")
+
+        paths = json.loads((self.repo / "tsconfig.paths.json").read_text())["compilerOptions"]["paths"]
+        self.assertEqual(paths["@bigrock/*"], ["ext/bigrock/src/rock/*"])
+        self.assertEqual(paths["@ikea"], ["ext/ikea/src/index.ts"])    # bare path where index exists
+        self.assertNotIn("@shadelark", paths)                          # no index.ts -> no bare path
+        self.assertEqual(paths["@shadelark/*"], ["ext/shadelark/src/*"])
+
+    def test_sync_materialises_the_tree_too(self):
+        self.store.add("shadelark", "src/raster.ts", b"raster", deps=[])
+        self.store.add("ikea", "src/index.ts", b"e", deps=["shadelark"])
+        self._sync("ikea")
+        self.assertEqual((self.dest / "shadelark/src/raster.ts").read_bytes(), b"raster")
+        self.assertTrue((self.dest / ".closure.json").exists())
+
+    def test_sync_refuses_an_unresolved_root(self):
+        self.store.add("ikea", "src/index.ts", b"e", deps=[])
+        with self.assertRaises(kura_cli.KuraError):
+            self._sync("ikeaa")   # typo -> refuse, write no harness
+        self.assertFalse((self.repo / "tsconfig.paths.json").exists())
 
 
 if __name__ == "__main__":
