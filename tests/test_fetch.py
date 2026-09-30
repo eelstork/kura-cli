@@ -25,6 +25,19 @@ import kura_cli
 
 KEY = "test-key"
 
+_SESSION_TAG = None
+
+
+def setUpModule():
+    # these pin behaviour on main; a session's KURA_TAG must not reach them
+    global _SESSION_TAG
+    _SESSION_TAG = os.environ.pop("KURA_TAG", None)
+
+
+def tearDownModule():
+    if _SESSION_TAG is not None:
+        os.environ["KURA_TAG"] = _SESSION_TAG
+
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()

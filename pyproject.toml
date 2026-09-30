@@ -1,7 +1,7 @@
 [project]
 name = "kura-cli"
-version = "0.1.0"
-description = "Fetch a package's files out of a kura store."
+version = "0.2.0"
+description = "Fetch and publish a package's files in a kura store, on main or on a tag."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }

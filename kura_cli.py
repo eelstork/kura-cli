@@ -15,10 +15,20 @@ back to one GET /blob per digest — a package never fails whole on a single
 refused batch.
 
 Usage:
-    kura fetch <package> <dest> [--url URL] [--key KEY] [--no-strip] [--dry-run]
+    kura fetch   <package> <dest> [--tag TAG] [--no-strip] [--prune] [--dry-run]
+    kura resolve <dest> <root>... [--tag TAG] [--no-prune] [--dry-run]
+    kura sync    <dest> <root>... [--tag TAG] [--no-prune] [--dry-run]
+    kura publish <package> <dir> [<path>...] -m MESSAGE [--tag TAG] [--who WHO] [--dry-run]
 
     KURA_URL   store base URL   (default https://kura-staging.fly.dev)
     KURA_KEY   bearer token     (required unless --key is given)
+    KURA_TAG   the tag to read and publish on (default: none, i.e. main)
+    KURA_WHO   who a publish is signed by (default kura-cli)
+
+A tag is where an agent publishes packages without landing them on main: a
+build on the tag reads each package the tag carries from the tag, and every
+other package from main. Pick one tag for a piece of work, set KURA_TAG, and
+publish and build on it; `main` (or an empty tag) means main.
 
 Speaks only the Python standard library, so a session can vendor this one file
 and run it with nothing to install.
@@ -27,6 +37,7 @@ and run it with nothing to install.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -39,6 +50,7 @@ from pathlib import Path
 
 DEFAULT_URL = "https://kura-staging.fly.dev"
 BACKOFF = (2, 4, 8)  # seconds between retries of a transient network failure
+RACE_BACKOFF = (1, 2, 4)  # seconds before re-reading a base another publish moved
 TIMEOUT = 300
 
 
@@ -80,9 +92,18 @@ def _get_json(base, path, token):
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise KuraError("the store rejected the key (401) — check KURA_KEY")
-        raise KuraError(f"GET {path} -> HTTP {e.code}")
+        why = _detail_text(e)
+        raise KuraError(f"GET {path} -> HTTP {e.code}{': ' + why if why else ''}")
     except (urllib.error.URLError, OSError) as e:
         raise KuraError(f"GET {path} failed: {e}")
+
+
+def _detail_text(err):
+    """The store's own words for a refusal, if it gave any."""
+    detail = _safe_detail(err)
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("conflict") or detail
+    return detail if isinstance(detail, str) else (json.dumps(detail) if detail else "")
 
 
 def _read_exactly(fp, n):
@@ -183,6 +204,45 @@ def _deliver(base, token, digests, on_blob):
         _deliver(base, token, rest[mid:], on_blob)
 
 
+# --- tags ------------------------------------------------------------------
+#
+# A tag is a named place on the store: a package published on it is read only
+# by a build on the same tag, and through the tag every other package still
+# comes from main. An older store ignores `tag` wherever it appears — it would
+# serve main to a tag build, and land a tag publish on main — so every command
+# that is given a tag first makes the store confirm it knows the tag.
+
+def _tag_of(tag):
+    """The tag asked for (else $KURA_TAG), or None for main. `main` is not a
+    tag but the absence of one, and a build ARG that nobody passed is empty."""
+    if tag is None:
+        tag = os.environ.get("KURA_TAG")
+    tag = (tag or "").strip()
+    return None if tag in ("", "main") else tag
+
+
+def _too_old(tag):
+    return KuraError(
+        f"this store does not know tags — it would ignore tag {tag!r} and use main. "
+        f"It needs a kura new enough to serve tags.")
+
+
+def _tag_base(base, token, tag):
+    """The tag's own base, from a store that confirms it knows the tag."""
+    body = _get_json(base, f"/base?tag={_quote(tag)}", token)
+    if body.get("tag") != tag:
+        raise _too_old(tag)
+    return body["base"]
+
+
+def _endpoint(url, key):
+    base = (url or os.environ.get("KURA_URL") or DEFAULT_URL).rstrip("/")
+    token = key or os.environ.get("KURA_KEY")
+    if not token:
+        raise KuraError("no key: set KURA_KEY or pass --key")
+    return base, token
+
+
 # --- fetch -----------------------------------------------------------------
 
 def _on_disk_matches(path: Path, digest: str) -> bool:
@@ -209,7 +269,7 @@ ALIASES = ".aliases.json"
 TSCONFIG_PATHS = "tsconfig.paths.json"
 
 
-def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=False):
+def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=False, tag=None):
     """Materialise `package` from the store into `dest`.
 
     Returns a summary dict: files, written, skipped, fetched_blobs, fetched_bytes
@@ -217,15 +277,19 @@ def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=Fa
     stripped so `dest` holds the package's tree directly; pass strip=False to
     keep it. With prune=True, files under `dest` that the package no longer
     lists are removed afterwards (a consumer's `.provenance.json` is left), so
-    a re-sync moves only what changed and leaves nothing stale behind.
+    a re-sync moves only what changed and leaves nothing stale behind. With a
+    tag (default $KURA_TAG), the package is read as a build on that tag sees it.
     """
-    base = (url or os.environ.get("KURA_URL") or DEFAULT_URL).rstrip("/")
-    token = key or os.environ.get("KURA_KEY")
-    if not token:
-        raise KuraError("no key: set KURA_KEY or pass --key")
+    base, token = _endpoint(url, key)
     dest = Path(dest)
+    tag = _tag_of(tag)
+    query = f"/manifest?package={_quote(package)}"
+    if tag:
+        # a manifest cannot say whether the tag was honoured, so ask first
+        _tag_base(base, token, tag)
+        query += f"&tag={_quote(tag)}"
 
-    manifest = _get_json(base, f"/manifest?package={_quote(package)}", token)
+    manifest = _get_json(base, query, token)
     if not manifest:
         raise KuraError(f"the store has no package named {package!r} (empty manifest)")
 
@@ -252,10 +316,10 @@ def fetch(package, dest, url=None, key=None, strip=True, dry_run=False, prune=Fa
     if dry_run:
         return {"files": len(manifest), "written": 0, "skipped": skipped,
                 "fetched_blobs": 0, "fetched_bytes": 0, "would_fetch_blobs": len(needed),
-                "would_prune": len(stale)}
+                "would_prune": len(stale), "tag": tag}
 
     summary = {"files": len(manifest), "written": 0, "skipped": skipped,
-               "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0}
+               "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0, "tag": tag}
 
     def on_blob(digest, data):
         if hashlib.sha256(data).hexdigest() != digest:
@@ -302,7 +366,7 @@ def _quote(s: str) -> str:
 # blobs shared across packages move once. The tree lands at dest/<package>/...,
 # the layout a consumer aliases `@<package>` against.
 
-def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
+def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True, tag=None):
     """Materialise the transitive closure of `roots` into `dest`.
 
     Returns a summary dict: packages, base, files, written, skipped,
@@ -310,15 +374,19 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
     `.closure.json` beside the tree — the roots, the packages resolved and the
     base the store read them at — so a build records exactly which world it
     drew from. With prune (the default) files the closure no longer names are
-    removed, so a re-resolve leaves nothing stale from a dependency that left."""
-    base_url = (url or os.environ.get("KURA_URL") or DEFAULT_URL).rstrip("/")
-    token = key or os.environ.get("KURA_KEY")
-    if not token:
-        raise KuraError("no key: set KURA_KEY or pass --key")
+    removed, so a re-resolve leaves nothing stale from a dependency that left.
+
+    With a tag (default $KURA_TAG), each package the tag carries comes from the
+    tag and every other from main; the summary and `.closure.json` then also
+    record the tag, the packages it supplied (`tagged`) and its `tag_base`."""
+    base_url, token = _endpoint(url, key)
     dest = Path(dest)
+    tag = _tag_of(tag)
 
     q = ",".join(_quote(r) for r in roots)
-    body = _get_json(base_url, f"/closure?roots={q}", token)
+    body = _get_json(base_url, f"/closure?roots={q}" + (f"&tag={_quote(tag)}" if tag else ""), token)
+    if tag and body.get("tag") != tag:
+        raise _too_old(tag)
     manifest: dict[str, str] = body.get("manifest", {})
     packages: list[str] = body.get("packages", [])
     store_base = body.get("base")
@@ -352,13 +420,17 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
     keep.add(dest / CLOSURE)  # the lockfile is ours, never stale
     stale = _stale(dest, keep) if prune else []
 
+    # which world this is: main alone, or main seen through a tag
+    world = {"tag": tag, "tagged": body.get("tagged", []), "tag_base": body.get("tag_base")} if tag else {}
+
     if dry_run:
         return {"packages": packages, "base": store_base, "roots": roots_map, "files": len(manifest),
                 "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0,
-                "would_fetch_blobs": len(needed), "would_prune": len(stale)}
+                "would_fetch_blobs": len(needed), "would_prune": len(stale), **world}
 
     summary = {"packages": packages, "base": store_base, "roots": roots_map, "files": len(manifest),
-               "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0}
+               "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0,
+               **world}
 
     def on_blob(digest, data):
         if hashlib.sha256(data).hexdigest() != digest:
@@ -381,7 +453,7 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True):
     dest.mkdir(parents=True, exist_ok=True)
     (dest / CLOSURE).write_text(
         json.dumps({"requested": list(roots), "packages": packages, "base": store_base,
-                    "roots": roots_map}, indent=2, sort_keys=True) + "\n")
+                    "roots": roots_map, **world}, indent=2, sort_keys=True) + "\n")
     return summary
 
 
@@ -416,12 +488,13 @@ def _harness(dest: Path, packages, roots_map):
     return aliases, ts_paths
 
 
-def sync(dest, roots, url=None, key=None, dry_run=False, prune=True):
+def sync(dest, roots, url=None, key=None, dry_run=False, prune=True, tag=None):
     """Resolve the closure of `roots` into `dest`, then write the consumer's
     generated harness beside it: `<dest>/.aliases.json` (the vite/vitest alias
     map) and `<repo>/tsconfig.paths.json` (tsc's paths), both from the store's
-    closure data. Returns resolve's summary plus `aliased` (the alias count)."""
-    res = resolve(dest, roots, url=url, key=key, dry_run=dry_run, prune=prune)
+    closure data. Returns resolve's summary plus `aliased` (the alias count).
+    A tag (default $KURA_TAG) is read through as for `resolve`."""
+    res = resolve(dest, roots, url=url, key=key, dry_run=dry_run, prune=prune, tag=tag)
     if dry_run:
         return res
     dest = Path(dest)
@@ -433,23 +506,123 @@ def sync(dest, roots, url=None, key=None, dry_run=False, prune=True):
     return res
 
 
+# --- publish: hand a package's whole tree to the store ----------------------
+#
+# The store's publish verb sets a package's tree to exactly the files it is
+# given, burying whatever they no longer include, in one changeset. `publish`
+# gathers those files from a directory — all of it, or the paths named under it
+# — and hands them over against the base it has just read, re-reading and
+# retrying if another publish moved that base first. With a tag (default
+# $KURA_TAG) the tree lands on the tag and main does not move.
+
+# never package content, whatever directory is published
+SKIP_DIRS = {".git", "node_modules", "__pycache__"}
+
+
+def _collect(src: Path, paths) -> dict:
+    """relpath (under src, posix) -> bytes for every file the publish covers."""
+    if not src.is_dir():
+        raise KuraError(f"{src} is not a directory")
+    root = src.resolve()
+    files: dict[str, bytes] = {}
+    for named in paths or ["."]:
+        target = (src / named).resolve()
+        if target != root and root not in target.parents:
+            raise KuraError(f"{named} is not under {src}")
+        if not target.exists():
+            raise KuraError(f"{named} does not exist under {src}")
+        if target.is_file():
+            files[target.relative_to(root).as_posix()] = target.read_bytes()
+            continue
+        for p in sorted(target.rglob("*")):
+            if p.is_file() and not SKIP_DIRS & set(p.relative_to(target).parts):
+                files[p.relative_to(root).as_posix()] = p.read_bytes()
+    return dict(sorted(files.items()))
+
+
+def publish(package, src, paths=None, message=None, tag=None, who=None, url=None, key=None, dry_run=False):
+    """Set `package`'s tree in the store to the files under `src` (or under the
+    `paths` named within it), keyed relative to `src`.
+
+    Returns a summary dict: package, tag (None for main), files, bytes, and —
+    once sent — seq, written and buried, as the store reports them."""
+    base_url, token = _endpoint(url, key)
+    tag = _tag_of(tag)
+    who = who or os.environ.get("KURA_WHO") or "kura-cli"
+    files = _collect(Path(src), paths)
+    if not files:
+        raise KuraError(f"nothing to publish under {src}")
+    summary = {"package": package, "tag": tag, "files": len(files),
+               "bytes": sum(len(b) for b in files.values())}
+    if dry_run:
+        summary["paths"] = list(files)
+        return summary
+    encoded = {rel: base64.b64encode(data).decode() for rel, data in files.items()}
+    last = None
+    for attempt in range(len(RACE_BACKOFF) + 1):
+        if attempt:
+            time.sleep(RACE_BACKOFF[attempt - 1])
+        # read the base anew each time: a race means another publish moved it
+        store_base = _tag_base(base_url, token, tag) if tag else _get_json(base_url, "/base", token)["base"]
+        body = {"who": who, "base": store_base, "message": message or "", "files": encoded}
+        if tag:
+            body["tag"] = tag
+        try:
+            with _request(base_url + f"/packages/{_quote(package)}/publish", token,
+                          data=json.dumps(body).encode()) as r:
+                res = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise KuraError(f"the store rejected the key ({e.code}) — check KURA_KEY")
+            if e.code == 409 or e.code >= 500:
+                last = f"HTTP {e.code}: {_detail_text(e)}"
+                continue
+            raise KuraError(f"the store refused the publish (HTTP {e.code}): {_detail_text(e)}")
+        except (urllib.error.URLError, OSError) as e:
+            # a restated tree records nothing, so sending it again is safe
+            last = str(e)
+            continue
+        summary.update(seq=res.get("seq"), written=res.get("written"), buried=res.get("buried", []))
+        return summary
+    raise KuraError(f"could not publish {package} after {len(RACE_BACKOFF) + 1} attempts ({last})")
+
+
 # --- CLI -------------------------------------------------------------------
 
+def _add_common(p):
+    p.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
+    p.add_argument("--key", help="bearer token (default $KURA_KEY)")
+    p.add_argument("--tag", help="work on this tag (default $KURA_TAG); 'main' or empty means main")
+    p.add_argument("--dry-run", action="store_true", help="report what would happen, change nothing")
+    p.add_argument("--quiet", action="store_true", help="print nothing on success")
+
+
+def _on(tag):
+    return f"on tag {tag}" if tag else "on main"
+
+
+def _drawn(res):
+    """Where a build on a tag drew its packages from, in a few words."""
+    if not res.get("tag"):
+        return ""
+    tagged = res.get("tagged") or []
+    if not tagged:
+        return f" on tag {res['tag']} (nothing on the tag: all from main)"
+    return f" on tag {res['tag']} (from the tag: {', '.join(tagged)}; the rest from main)"
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="kura", description="fetch packages out of a kura store")
+    parser = argparse.ArgumentParser(prog="kura", description="fetch and publish packages in a kura store")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("fetch", help="materialise a package into a directory")
     f.add_argument("package")
     f.add_argument("dest")
-    f.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
-    f.add_argument("--key", help="bearer token (default $KURA_KEY)")
+    _add_common(f)
     f.add_argument("--no-strip", dest="strip", action="store_false",
                    help="keep the leading <package>/ prefix on written paths")
-    f.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
     f.add_argument("--prune", action="store_true",
                    help="afterwards, remove files under <dest> the package no longer lists")
-    f.add_argument("--quiet", action="store_true", help="print nothing on success")
     # Accepted so that it can be refused, at the source, in the team's words:
     # pinning is not helpful in active development, so nobody pins.
     f.add_argument("--pin", metavar="PIN", help=argparse.SUPPRESS)
@@ -457,22 +630,24 @@ def main(argv=None):
     r = sub.add_parser("resolve", help="materialise root packages and their whole dependency closure")
     r.add_argument("dest")
     r.add_argument("roots", nargs="+", help="root packages; their transitive closure is fetched")
-    r.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
-    r.add_argument("--key", help="bearer token (default $KURA_KEY)")
-    r.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
+    _add_common(r)
     r.add_argument("--no-prune", dest="prune", action="store_false",
                    help="keep files the closure no longer names (default: prune them)")
-    r.add_argument("--quiet", action="store_true", help="print nothing on success")
 
     s = sub.add_parser("sync", help="resolve a closure and write the consumer's generated harness")
     s.add_argument("dest")
     s.add_argument("roots", nargs="+", help="root packages; their transitive closure is fetched")
-    s.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
-    s.add_argument("--key", help="bearer token (default $KURA_KEY)")
-    s.add_argument("--dry-run", action="store_true", help="report what would be fetched, write nothing")
+    _add_common(s)
     s.add_argument("--no-prune", dest="prune", action="store_false",
                    help="keep files the closure no longer names (default: prune them)")
-    s.add_argument("--quiet", action="store_true", help="print nothing on success")
+
+    pb = sub.add_parser("publish", help="set a package's tree to the files under a directory")
+    pb.add_argument("package")
+    pb.add_argument("src", help="the directory the package's paths are relative to")
+    pb.add_argument("paths", nargs="*", help="files or directories under <src> to publish (default: all of it)")
+    pb.add_argument("-m", "--message", required=True, help="why this publish was made (12-256 characters)")
+    pb.add_argument("--who", help="who the publish is signed by (default $KURA_WHO or kura-cli)")
+    _add_common(pb)
 
     args = parser.parse_args(argv)
 
@@ -483,49 +658,64 @@ def main(argv=None):
         return 2
 
     try:
-        if args.cmd == "sync":
+        if args.cmd == "publish":
+            res = publish(args.package, args.src, args.paths, message=args.message, tag=args.tag,
+                          who=args.who, url=args.url, key=args.key, dry_run=args.dry_run)
+        elif args.cmd == "sync":
             res = sync(args.dest, args.roots, url=args.url, key=args.key,
-                       dry_run=args.dry_run, prune=args.prune)
+                       dry_run=args.dry_run, prune=args.prune, tag=args.tag)
         elif args.cmd == "resolve":
             res = resolve(args.dest, args.roots, url=args.url, key=args.key,
-                          dry_run=args.dry_run, prune=args.prune)
+                          dry_run=args.dry_run, prune=args.prune, tag=args.tag)
         else:
             res = fetch(args.package, args.dest, url=args.url, key=args.key,
-                        strip=args.strip, dry_run=args.dry_run, prune=args.prune)
+                        strip=args.strip, dry_run=args.dry_run, prune=args.prune, tag=args.tag)
     except KuraError as e:
         print(f"kura: {e}", file=sys.stderr)
         return 1
 
     if args.quiet:
         return 0
-    if args.cmd == "sync":
+    if args.cmd == "publish":
+        mb = res["bytes"] / 1e6
+        if args.dry_run:
+            print(f"kura: would publish {args.package} {_on(res['tag'])}: {res['files']} file(s), "
+                  f"{mb:.1f} MB — nothing sent")
+        else:
+            buried = res.get("buried") or []
+            print(f"kura: published {args.package} {_on(res['tag'])}: {res['files']} file(s), "
+                  f"{res.get('written')} written, {len(buried)} buried ({mb:.1f} MB)"
+                  + (f"; buried {', '.join(buried)}" if buried else ""))
+    elif args.cmd == "sync":
         n = len(res["packages"])
         if args.dry_run:
-            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}: {n} package(s); "
+            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}{_drawn(res)}: {n} package(s); "
                   f"would fetch {res['would_fetch_blobs']}")
         else:
             mb = res["fetched_bytes"] / 1e6
-            print(f"kura: synced {n} package(s) -> {args.dest} @base {res['base']}; "
+            print(f"kura: synced {n} package(s) -> {args.dest} @base {res['base']}{_drawn(res)}; "
                   f"wrote {res['written']}, pruned {res['pruned']} ({mb:.1f} MB); "
                   f"harness: {res['aliased']} aliases + tsconfig paths")
     elif args.cmd == "resolve":
         n = len(res["packages"])
         if args.dry_run:
-            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}: {n} package(s), "
+            print(f"kura: closure of {'+'.join(args.roots)} @base {res['base']}{_drawn(res)}: {n} package(s), "
                   f"{res['files']} file(s); would fetch {res['would_fetch_blobs']}, would prune {res['would_prune']}")
         else:
             mb = res["fetched_bytes"] / 1e6
-            print(f"kura: resolved {n} package(s) -> {args.dest} @base {res['base']}; "
+            print(f"kura: resolved {n} package(s) -> {args.dest} @base {res['base']}{_drawn(res)}; "
                   f"wrote {res['written']}, skipped {res['skipped']}, pruned {res['pruned']} "
                   f"({res['fetched_blobs']} blob(s), {mb:.1f} MB)")
     elif args.dry_run:
         prune = f", would prune {res['would_prune']}" if args.prune else ""
-        print(f"kura: {args.package}: {res['files']} file(s); "
+        on = f" {_on(res['tag'])}" if res.get("tag") else ""
+        print(f"kura: {args.package}{on}: {res['files']} file(s); "
               f"{res['skipped']} already present, would fetch {res['would_fetch_blobs']} blob(s){prune}")
     else:
         mb = res["fetched_bytes"] / 1e6
         prune = f", pruned {res['pruned']}" if args.prune else ""
-        print(f"kura: {args.package}: {res['files']} file(s) -> {args.dest}; "
+        on = f" {_on(res['tag'])}" if res.get("tag") else ""
+        print(f"kura: {args.package}{on}: {res['files']} file(s) -> {args.dest}; "
               f"wrote {res['written']}, skipped {res['skipped']}{prune} "
               f"({res['fetched_blobs']} blob(s), {mb:.1f} MB fetched)")
     return 0
