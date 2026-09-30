@@ -126,18 +126,12 @@ refuses if it cannot.
 
 ### Building on a tag
 
-A build that fetches with `kura sync` reads the tag from `KURA_TAG`. For an
-image build, declare it in the stage that fetches, so the deployer can pass it
-in (kimi does, for a deploy on a tag):
+A build that fetches with `kura sync` reads the tag from `KURA_TAG`. Nothing
+in the repo sets it: kimi, deploying on a tag, tells the build and the running
+app (see kimi's README). With no tag the build reads main, as before.
 
-```dockerfile
-ARG KURA_TAG
-RUN --mount=type=secret,id=KURA_KEY node fetch-packages.mjs && npx vite build
-```
-
-and fetch with a kura-cli that knows tags: one from before them ignores
-`KURA_TAG` and quietly builds from main. With no tag passed the ARG is empty,
-which is main, so the same Dockerfile keeps building main as before.
+A kura-cli from before tags ignores `KURA_TAG` and quietly reads main, so an
+app that pins kura-cli needs a pin from after tags landed.
 
 The tool speaks the `/blobs2` wire format so a caller does not have to. For the
 record, that format is: `application/octet-stream`, one frame per requested
