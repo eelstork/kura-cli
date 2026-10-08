@@ -42,6 +42,7 @@ kura fetch   <package> <dest> [--tag TAG] [--no-strip] [--prune] [--dry-run] [--
 kura resolve <dest> <root>... [--tag TAG] [--no-prune] [--dry-run] [--quiet]
 kura sync    <dest> <root>... [--tag TAG] [--no-prune] [--dry-run] [--quiet]
 kura publish <package> <dir> [<path>...] -m MESSAGE [--tag TAG] [--who WHO] [--dry-run] [--quiet]
+             [--source-repo R] [--source-branch B] [--source-commit C] [--no-source]
 ```
 
 Every command also takes `--url URL` and `--key KEY`.
@@ -91,6 +92,25 @@ It reads the store's base just before sending, and if another publish moved it
 first, reads it again and retries. `--dry-run` lists what would be sent and
 sends nothing.
 
+### Where a package came from
+
+A publish says where its tree came from, read from git in `<dir>`: the repo,
+the branch and the commit. The store keeps it on the landing and shows it on
+the package (and in every closure a build reads), so anyone can tell which
+repo, branch and commit a package was published out of.
+
+```sh
+$ kura publish planetoid . src -m "planetoid: publish the world engine"
+kura: published planetoid on main from eelstork/planetoid@main 161955b: 412 file(s), 3 written, 0 buried (4.1 MB)
+```
+
+- The repo is **named** (`owner/name`, from `origin`), never addressed: an
+  origin URL that carries a token sends only the name.
+- A detached HEAD sends no branch; a checkout with no `origin` sends no repo; a
+  directory not in git sends no source at all.
+- `--source-repo`, `--source-branch` and `--source-commit` say it yourself and
+  win over git; `--no-source` sends none.
+
 ## Tags
 
 A tag is where you publish packages that only builds on the same tag will see.
@@ -115,6 +135,8 @@ kura: synced 14 package(s) -> ext @base 1270 on tag fern (from the tag: diarch; 
 still publish on main when the work is done. A tag nothing was published on
 reads as main. `.closure.json` records `tag`, `tagged` (the packages the tag
 supplied) and `tag_base` beside the base, so a build says which world it drew.
+It also records `published`: each package's latest landing as the store
+reports it — who, when, why, and the repo, branch and commit it came from.
 
 Tag names are 1–40 lowercase letters, digits and inner hyphens — a tag also
 names a deploy (`metropolis-fern`) — and the store refuses `staging`,

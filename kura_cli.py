@@ -19,6 +19,7 @@ Usage:
     kura resolve <dest> <root>... [--tag TAG] [--no-prune] [--dry-run]
     kura sync    <dest> <root>... [--tag TAG] [--no-prune] [--dry-run]
     kura publish <package> <dir> [<path>...] -m MESSAGE [--tag TAG] [--who WHO] [--dry-run]
+                 [--source-repo R] [--source-branch B] [--source-commit C] [--no-source]
 
     KURA_URL   store base URL   (default https://kura-staging.fly.dev)
     KURA_KEY   bearer token     (required unless --key is given)
@@ -29,6 +30,11 @@ A tag is where an agent publishes packages without landing them on main: a
 build on the tag reads each package the tag carries from the tag, and every
 other package from main. Pick one tag for a piece of work, set KURA_TAG, and
 publish and build on it; `main` (or an empty tag) means main.
+
+A publish says where its tree came from: the repo (named owner/name, never its
+address), the branch and the commit, read from git in the published directory.
+sync and resolve keep the store's record of where each package came from in
+`.closure.json`.
 
 Speaks only the Python standard library, so a session can vendor this one file
 and run it with nothing to install.
@@ -42,6 +48,7 @@ import hashlib
 import json
 import os
 import struct
+import subprocess
 import sys
 import time
 import urllib.error
@@ -256,8 +263,9 @@ def _on_disk_matches(path: Path, digest: str) -> bool:
 PROVENANCE = ".provenance.json"
 
 # resolve's record beside the tree: the roots requested, the packages the
-# closure covered, the base the store read them at, and each package's public
-# root — a build's note of which world it drew from. Ours, never a package's
+# closure covered, the base the store read them at, each package's public root,
+# and where each package came from (`published`) — a build's note of which
+# world it drew from. Ours, never a package's
 # file, never pruned.
 CLOSURE = ".closure.json"
 
@@ -391,6 +399,10 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True, tag=None
     packages: list[str] = body.get("packages", [])
     store_base = body.get("base")
     roots_map: dict[str, str] = body.get("roots", {})  # package -> its public root
+    # package -> its latest landing as the store reports it: who, when, why, and
+    # the repo, branch and commit it was published from (a store from before
+    # sources reports none)
+    published: dict[str, dict] = body.get("published", {})
 
     # A root that does not resolve — a typo, a package not yet published, or the
     # wrong store — comes back simply absent from the closure, not as an error.
@@ -426,11 +438,11 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True, tag=None
     if dry_run:
         return {"packages": packages, "base": store_base, "roots": roots_map, "files": len(manifest),
                 "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0,
-                "would_fetch_blobs": len(needed), "would_prune": len(stale), **world}
+                "would_fetch_blobs": len(needed), "would_prune": len(stale), "published": published, **world}
 
     summary = {"packages": packages, "base": store_base, "roots": roots_map, "files": len(manifest),
                "written": 0, "skipped": skipped, "fetched_blobs": 0, "fetched_bytes": 0, "pruned": 0,
-               **world}
+               "published": published, **world}
 
     def on_blob(digest, data):
         if hashlib.sha256(data).hexdigest() != digest:
@@ -453,7 +465,7 @@ def resolve(dest, roots, url=None, key=None, dry_run=False, prune=True, tag=None
     dest.mkdir(parents=True, exist_ok=True)
     (dest / CLOSURE).write_text(
         json.dumps({"requested": list(roots), "packages": packages, "base": store_base,
-                    "roots": roots_map, **world}, indent=2, sort_keys=True) + "\n")
+                    "roots": roots_map, "published": published, **world}, indent=2, sort_keys=True) + "\n")
     return summary
 
 
@@ -540,20 +552,87 @@ def _collect(src: Path, paths) -> dict:
     return dict(sorted(files.items()))
 
 
-def publish(package, src, paths=None, message=None, tag=None, who=None, url=None, key=None, dry_run=False):
+# --- source: where a published tree came from -------------------------------
+#
+# The store cannot reach a repo, so a publish says where its tree came from and
+# the store keeps that word. It is read from git in the published directory:
+# the repo, the branch and the commit. The repo is NAMED (owner/name), never
+# addressed — an origin URL may carry a token, and nothing of it but the name
+# leaves the machine.
+
+def _git(cwd, *args):
+    """git's answer in `cwd`, or None when git is absent or says no."""
+    try:
+        r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else None
+
+
+def _repo_name(remote):
+    """owner/name from any form of origin: https (with or without a token),
+    ssh, scp-like (git@host:owner/name) or a proxy's path — the last two
+    segments of its path, without `.git`. Never the host, never credentials."""
+    path = remote.strip().rstrip("/")
+    if "://" in path:
+        path = path.split("://", 1)[1].split("/", 1)[1] if "/" in path.split("://", 1)[1] else ""
+    elif ":" in path and not path.startswith("/"):
+        path = path.split(":", 1)[1]  # scp-like: [user@]host:owner/name
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [p for p in path.split("/") if p]
+    return "/".join(parts[-2:]) if parts else None
+
+
+def git_source(src):
+    """{repo, branch, commit} for the git checkout holding `src` — whichever
+    git can say — or None when `src` is not in git. A detached HEAD has no
+    branch; a checkout with no origin has no repo."""
+    commit = _git(src, "rev-parse", "HEAD")
+    if commit is None:
+        return None
+    source = {"commit": commit}
+    branch = _git(src, "symbolic-ref", "--short", "-q", "HEAD")
+    if branch:
+        source["branch"] = branch
+    remote = _git(src, "remote", "get-url", "origin")
+    repo = _repo_name(remote) if remote else None
+    if repo:
+        source["repo"] = repo
+    return source
+
+
+def _source_text(source):
+    """A source in a few words: repo@branch and the short commit."""
+    if not source:
+        return ""
+    where = "@".join(x for x in (source.get("repo"), source.get("branch")) if x)
+    commit = (source.get("commit") or "")[:7]
+    return " ".join(x for x in (where, commit) if x)
+
+
+def publish(package, src, paths=None, message=None, tag=None, who=None, url=None, key=None, dry_run=False,
+            source=None, read_source=True):
     """Set `package`'s tree in the store to the files under `src` (or under the
     `paths` named within it), keyed relative to `src`.
 
-    Returns a summary dict: package, tag (None for main), files, bytes, and —
-    once sent — seq, written and buried, as the store reports them."""
+    The publish says where the tree came from: `source` ({repo, branch,
+    commit}), read from git in `src` unless `read_source` is off; whatever
+    `source` names itself wins over what git says.
+
+    Returns a summary dict: package, tag (None for main), files, bytes, source,
+    and — once sent — seq, written and buried, as the store reports them."""
     base_url, token = _endpoint(url, key)
     tag = _tag_of(tag)
     who = who or os.environ.get("KURA_WHO") or "kura-cli"
     files = _collect(Path(src), paths)
     if not files:
         raise KuraError(f"nothing to publish under {src}")
+    said = {k: v for k, v in (source or {}).items() if v}
+    source = {**((git_source(src) or {}) if read_source else {}), **said} or None
     summary = {"package": package, "tag": tag, "files": len(files),
-               "bytes": sum(len(b) for b in files.values())}
+               "bytes": sum(len(b) for b in files.values()), "source": source}
     if dry_run:
         summary["paths"] = list(files)
         return summary
@@ -567,6 +646,8 @@ def publish(package, src, paths=None, message=None, tag=None, who=None, url=None
         body = {"who": who, "base": store_base, "message": message or "", "files": encoded}
         if tag:
             body["tag"] = tag
+        if source:
+            body["source"] = source
         try:
             with _request(base_url + f"/packages/{_quote(package)}/publish", token,
                           data=json.dumps(body).encode()) as r:
@@ -647,6 +728,11 @@ def main(argv=None):
     pb.add_argument("paths", nargs="*", help="files or directories under <src> to publish (default: all of it)")
     pb.add_argument("-m", "--message", required=True, help="why this publish was made (12-256 characters)")
     pb.add_argument("--who", help="who the publish is signed by (default $KURA_WHO or kura-cli)")
+    pb.add_argument("--source-repo", help="the repo the tree came from, owner/name (default: read from git)")
+    pb.add_argument("--source-branch", help="the branch it came from (default: read from git)")
+    pb.add_argument("--source-commit", help="the commit it came from (default: read from git)")
+    pb.add_argument("--no-source", dest="read_source", action="store_false",
+                    help="do not read git for where the tree came from")
     _add_common(pb)
 
     args = parser.parse_args(argv)
@@ -659,8 +745,10 @@ def main(argv=None):
 
     try:
         if args.cmd == "publish":
+            said = {"repo": args.source_repo, "branch": args.source_branch, "commit": args.source_commit}
             res = publish(args.package, args.src, args.paths, message=args.message, tag=args.tag,
-                          who=args.who, url=args.url, key=args.key, dry_run=args.dry_run)
+                          who=args.who, url=args.url, key=args.key, dry_run=args.dry_run,
+                          source=said, read_source=args.read_source)
         elif args.cmd == "sync":
             res = sync(args.dest, args.roots, url=args.url, key=args.key,
                        dry_run=args.dry_run, prune=args.prune, tag=args.tag)
@@ -678,12 +766,13 @@ def main(argv=None):
         return 0
     if args.cmd == "publish":
         mb = res["bytes"] / 1e6
+        came = f" from {_source_text(res['source'])}" if res.get("source") else ""
         if args.dry_run:
-            print(f"kura: would publish {args.package} {_on(res['tag'])}: {res['files']} file(s), "
+            print(f"kura: would publish {args.package} {_on(res['tag'])}{came}: {res['files']} file(s), "
                   f"{mb:.1f} MB — nothing sent")
         else:
             buried = res.get("buried") or []
-            print(f"kura: published {args.package} {_on(res['tag'])}: {res['files']} file(s), "
+            print(f"kura: published {args.package} {_on(res['tag'])}{came}: {res['files']} file(s), "
                   f"{res.get('written')} written, {len(buried)} buried ({mb:.1f} MB)"
                   + (f"; buried {', '.join(buried)}" if buried else ""))
     elif args.cmd == "sync":

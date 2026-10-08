@@ -49,6 +49,7 @@ class StubStore:
         self.tag_deps: dict[str, dict[str, list[str]]] = {}
         self.tag_base: dict[str, int] = {}
         self.publishes: list[dict] = []   # every publish body received
+        self.published: dict = {}         # (tag, package) -> its latest landing, as kura reports it
         self.races = 0                    # answer this many publishes with 409 first
 
     def _put(self, data):
@@ -94,7 +95,9 @@ class StubStore:
         for p in sorted(seen):
             manifest.update(self.package_on(p, tag))
         out = {"packages": sorted(seen), "manifest": manifest, "base": self.base,
-               "roots": {p: "src" for p in sorted(seen)}}
+               "roots": {p: "src" for p in sorted(seen)},
+               "published": {p: self.published[(tag if p in carried else None, p)] for p in sorted(seen)
+                             if (tag if p in carried else None, p) in self.published}}
         if tag:
             out.update(tag=tag, tagged=sorted(seen & set(carried)), tag_base=self.tag_base.get(tag, 0))
         return out
@@ -119,6 +122,8 @@ class StubStore:
             before = self.files.get(name, {})
             self.files[name] = tree
             self.base += 1
+        self.published[(tag, name)] = {"seq": current, "who": body["who"], "when": "now",
+                                        "message": body["message"], "source": body.get("source")}
         out = {"seq": current, "written": sum(1 for p, d in tree.items() if before.get(p) != d),
                "buried": sorted(p for p in before if p not in tree)}
         if tag:
