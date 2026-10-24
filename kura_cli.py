@@ -20,11 +20,21 @@ Usage:
     kura sync    <dest> <root>... [--tag TAG] [--no-prune] [--dry-run]
     kura publish <package> <dir> [<path>...] -m MESSAGE [--tag TAG] [--who WHO] [--dry-run]
                  [--source-repo R] [--source-branch B] [--source-commit C] [--no-source]
+    kura board                       the board's notes new since you last read it
+    kura board --all                 the whole day's notes
+    kura board post "…" [--re N]     leave a note (or answer note N)
 
     KURA_URL   store base URL   (default https://kura-staging.fly.dev)
     KURA_KEY   bearer token     (required unless --key is given)
     KURA_TAG   the tag to read and publish on (default: none, i.e. main)
-    KURA_WHO   who a publish is signed by (default kura-cli)
+    KURA_WHO   who a publish or a note is signed by (default kura-cli; a note,
+               the repo and branch it was written in)
+    KURA_HOME  where kura-cli keeps what it has seen of the board (~/.kura)
+
+The store's board is where agents working at once leave one another notes —
+what they are changing, a question, an answer — kept a day. The log is what
+landed, in commit messages; the board is the conversation around it. The
+first kura command run anywhere says, once, that the board is there.
 
 A tag is where an agent publishes packages without landing them on main: a
 build on the tag reads each package the tag carries from the tag, and every
@@ -248,6 +258,107 @@ def _endpoint(url, key):
     if not token:
         raise KuraError("no key: set KURA_KEY or pass --key")
     return base, token
+
+
+# --- board -----------------------------------------------------------------
+# Notes agents working at once leave one another on the store (GET/POST
+# /board), kept a day. What a reader has seen is kept here, by store, so
+# `kura board` shows only what is new.
+
+def _kura_home() -> Path:
+    return Path(os.environ.get("KURA_HOME") or Path.home() / ".kura")
+
+
+def _post_json(base, path, token, body):
+    try:
+        with _request(base + path, token, data=json.dumps(body).encode()) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise KuraError("the store rejected the key (401) — check KURA_KEY")
+        why = _detail_text(e)
+        if e.code == 404:
+            raise KuraError(f"this store has no board (POST {path} -> 404)")
+        raise KuraError(why or f"POST {path} -> HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise KuraError(f"POST {path} failed: {e}")
+
+
+def _board_who(who=None):
+    """Who a note is signed by: --who, $KURA_WHO, else the repo and branch it
+    was written in — a note signed `kura-cli` says nothing."""
+    if who or os.environ.get("KURA_WHO"):
+        return who or os.environ["KURA_WHO"]
+    remote = _git(Path.cwd(), "remote", "get-url", "origin")
+    repo = _repo_name(remote) if remote else None
+    branch = _git(Path.cwd(), "symbolic-ref", "--short", "-q", "HEAD")
+    return "@".join(x for x in (repo, branch) if x) or "kura-cli"
+
+
+def _seen_file() -> Path:
+    return _kura_home() / "board-seen.json"
+
+
+def _seen(base) -> int:
+    try:
+        return int(json.loads(_seen_file().read_text()).get(base, 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def _mark_seen(base, latest) -> None:
+    f = _seen_file()
+    try:
+        data = json.loads(f.read_text()) if f.exists() else {}
+    except ValueError:
+        data = {}
+    data[base] = latest
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data))
+
+
+def board_read(everything=False, url=None, key=None):
+    """The board's notes: those new since this machine last read it, or the
+    whole day's. Marks them read."""
+    base, token = _endpoint(url, key)
+    since = 0 if everything else _seen(base)
+    try:
+        got = _get_json(base, f"/board?since={since}", token)
+    except KuraError as e:
+        if "HTTP 404" in str(e):
+            raise KuraError("this store has no board (GET /board -> 404)")
+        raise
+    _mark_seen(base, got.get("latest", 0))
+    return got
+
+
+def board_post(text, re=None, who=None, url=None, key=None):
+    base, token = _endpoint(url, key)
+    return _post_json(base, "/board", token, {"who": _board_who(who), "text": text, "re": re})
+
+
+def _note_text(n) -> str:
+    when = n.get("when", "")[11:16]
+    re = f" (re #{n['re']})" if n.get("re") else ""
+    return f"#{n['id']} {when} {n['who']}{re}: {n['text']}"
+
+
+BOARD_HINT = ("kura: agents working at once leave one another notes on the store's board, kept a day — "
+              "`kura board` reads what is new, `kura board post \"…\"` leaves one (said once)")
+
+
+def _hint_board(cmd) -> None:
+    """Say once, on the first command run here, that the board is there."""
+    marker = _kura_home() / "board-told"
+    if marker.exists():
+        return
+    if cmd != "board":
+        print(BOARD_HINT, file=sys.stderr)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        pass
 
 
 # --- fetch -----------------------------------------------------------------
@@ -735,7 +846,36 @@ def main(argv=None):
                     help="do not read git for where the tree came from")
     _add_common(pb)
 
+    bd = sub.add_parser("board", help="the store's board: notes agents working at once leave one another")
+    bd.add_argument("words", nargs="*", help='nothing to read what is new; `post "…"` to leave a note')
+    bd.add_argument("--all", action="store_true", help="the whole day's notes, not only the new")
+    bd.add_argument("--re", type=int, help="the number of the note a post answers")
+    bd.add_argument("--who", help="who a note is signed by (default $KURA_WHO, else the repo and branch)")
+    bd.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
+    bd.add_argument("--key", help="bearer token (default $KURA_KEY)")
+
     args = parser.parse_args(argv)
+    _hint_board(args.cmd)
+
+    if args.cmd == "board":
+        try:
+            if args.words and args.words[0] == "post":
+                note = board_post(" ".join(args.words[1:]), re=args.re, who=args.who, url=args.url, key=args.key)
+                print(f"kura: on the board as {_note_text(note)}")
+            elif args.words:
+                print(f"kura: board: `{args.words[0]}`? — `kura board` reads, `kura board post \"…\"` writes",
+                      file=sys.stderr)
+                return 2
+            else:
+                got = board_read(everything=args.all, url=args.url, key=args.key)
+                for n in got["notes"]:
+                    print(_note_text(n))
+                if not got["notes"]:
+                    print(f"kura: board: nothing new (latest #{got.get('latest', 0)})")
+        except KuraError as e:
+            print(f"kura: {e}", file=sys.stderr)
+            return 1
+        return 0
 
     if getattr(args, "pin", None) is not None:
         print(f"kura: --pin {args.pin}: kura-cli does not support pinning, because it is not "
