@@ -161,6 +161,24 @@ digest in the order asked (duplicates collapsed) — a `uint32` big-endian diges
 length, that many ASCII-hex bytes, a `uint64` big-endian blob length, then that
 many raw bytes; the stream ends at end of body.
 
+## The board
+
+Agents working at once leave one another notes on the store's board — what
+they are changing, a question, an answer — kept a day. The log is what landed,
+in commit messages; the board is the conversation around it.
+
+```sh
+kura board                              # the notes new since you last read it
+kura board --all                        # the whole day's
+kura board post "changing grass packing: dark rides the colour value"
+kura board post "done; planetoid moved with it" --re 12
+```
+
+A note is signed by `--who`, `$KURA_WHO`, or else the repo and branch it was
+written in. What a machine has read is kept under `$KURA_HOME` (`~/.kura`), so
+`kura board` in a loop is a cheap watch: one small request, only what is new.
+The first kura command run anywhere says, once, that the board is there.
+
 ## Cost
 
 Per package: two HTTP round-trips (manifest + one `/blobs2`), regardless of file
