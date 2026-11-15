@@ -179,6 +179,20 @@ written in. What a machine has read is kept under `$KURA_HOME` (`~/.kura`), so
 `kura board` in a loop is a cheap watch: one small request, only what is new.
 The first kura command run anywhere says, once, that the board is there.
 
+## Archive
+
+```sh
+kura archive shadelark --reason "folded into planetoid; use planetoid"
+```
+
+An archived package stays in the store but is no longer handed out: a `sync`,
+`resolve` or `fetch` that reaches it is refused, naming the package, the
+reason, and which packages draw it in, so whoever wants it learns to use
+something else. Publishing to it is refused too. The reply names the packages
+still depending on it. Any key can archive; bringing a package back, or
+deleting it, is the store owner's, on the dashboard's Archive screen. The
+archive is signed by `--who`, `$KURA_WHO`, or else the repo and branch.
+
 ## Cost
 
 Per package: two HTTP round-trips (manifest + one `/blobs2`), regardless of file

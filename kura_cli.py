@@ -23,6 +23,8 @@ Usage:
     kura board                       the board's notes new since you last read it
     kura board --all                 the whole day's notes
     kura board post "…" [--re N]     leave a note (or answer note N)
+    kura archive <package> [--reason WHY] [--who WHO]
+                                     archive a package: kept, no longer handed out
 
     KURA_URL   store base URL   (default https://kura-staging.fly.dev)
     KURA_KEY   bearer token     (required unless --key is given)
@@ -62,6 +64,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -335,6 +338,30 @@ def board_read(everything=False, url=None, key=None):
 def board_post(text, re=None, who=None, url=None, key=None):
     base, token = _endpoint(url, key)
     return _post_json(base, "/board", token, {"who": _board_who(who), "text": text, "re": re})
+
+
+# --- archive ---------------------------------------------------------------
+# An archived package stays in the store but is no longer handed out: a build
+# asking for it is refused, naming it, so whoever wants it uses something else.
+# Any key archives; bringing one back, or deleting it, is the store owner's, on
+# the dashboard's Archive screen.
+
+def archive(package, reason="", who=None, url=None, key=None):
+    """Archive `package`. The store's reply: {name, archived: {who, when,
+    reason}, used_by: [live packages still depending on it]}."""
+    base, token = _endpoint(url, key)
+    path = f"/packages/{urllib.parse.quote(package, safe='')}/archive"
+    body = {"who": _board_who(who), "reason": reason}
+    try:
+        with _request(base + path, token, data=json.dumps(body).encode()) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise KuraError(f"the store rejected the key ({e.code}) — check KURA_KEY")
+        why = _detail_text(e)
+        raise KuraError(why or f"POST {path} -> HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise KuraError(f"POST {path} failed: {e}")
 
 
 def _note_text(n) -> str:
@@ -854,8 +881,26 @@ def main(argv=None):
     bd.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
     bd.add_argument("--key", help="bearer token (default $KURA_KEY)")
 
+    ar = sub.add_parser("archive", help="archive a package: the store keeps it but no longer hands it out")
+    ar.add_argument("package")
+    ar.add_argument("--reason", default="", help="why, and what to use instead; builds refused it are told")
+    ar.add_argument("--who", help="who archived it (default $KURA_WHO, else the repo and branch)")
+    ar.add_argument("--url", help="store base URL (default $KURA_URL or the staging store)")
+    ar.add_argument("--key", help="bearer token (default $KURA_KEY)")
+
     args = parser.parse_args(argv)
     _hint_board(args.cmd)
+
+    if args.cmd == "archive":
+        try:
+            res = archive(args.package, reason=args.reason, who=args.who, url=args.url, key=args.key)
+        except KuraError as e:
+            print(f"kura: {e}", file=sys.stderr)
+            return 1
+        used = res.get("used_by") or []
+        print(f"kura: archived {args.package}; builds asking for it are refused"
+              + (f"; still used by {', '.join(used)}" if used else ""))
+        return 0
 
     if args.cmd == "board":
         try:
